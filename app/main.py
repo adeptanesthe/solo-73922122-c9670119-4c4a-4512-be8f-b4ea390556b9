@@ -12,7 +12,7 @@ from .csv_utils import CsvError, parse_machines_csv
 from .estimation import CATEGORIES
 from .storage import StoreError, store
 
-app = FastAPI(title="返修机故障占比估算", version="1.0.0")
+app = FastAPI(title="返修机故障占比估算", version="2.0.0")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -39,7 +39,8 @@ async def upload_batch(request: Request) -> dict:
     machines = parse_machines_csv(content)
     async with store.lock:
         store.reset_locked(machines)
-        return store.snapshot_locked()
+    # 新批次首快照：零实检 -> 缺样本门控，无拟合开销。
+    return await store.build_snapshot()
 
 
 @app.get("/api/batch")
@@ -50,7 +51,7 @@ async def get_batch() -> dict:
                 status_code=404,
                 content={"detail": "尚未上传批次，请先上传 CSV"},
             )
-        return store.snapshot_locked()
+    return await store.build_snapshot()
 
 
 @app.post("/api/machines/{machine_id}/inspect")
@@ -63,7 +64,8 @@ async def inspect_machine(machine_id: str, payload: InspectPayload) -> dict:
     async with store.lock:
         if store.is_empty_locked():
             raise StoreError("尚未上传批次，请先上传 CSV")
-        return store.update_inspection_locked(machine_id, payload.category)
+    # 修改在锁内即时落盘；拟合在锁外执行，不阻塞后续登记/更正/撤回。
+    return await store.update_inspection(machine_id, payload.category)
 
 
 @app.post("/api/machines/{machine_id}/withdraw")
@@ -71,7 +73,7 @@ async def withdraw_machine(machine_id: str) -> dict:
     async with store.lock:
         if store.is_empty_locked():
             raise StoreError("尚未上传批次，请先上传 CSV")
-        return store.update_inspection_locked(machine_id, None)
+    return await store.update_inspection(machine_id, None)
 
 
 @app.get("/", response_class=HTMLResponse)

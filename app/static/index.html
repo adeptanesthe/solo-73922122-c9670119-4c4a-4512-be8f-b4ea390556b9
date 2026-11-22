@@ -130,9 +130,29 @@
 <script>
 const CATS = ["power", "drive", "control"];
 const LABELS = {power: "电源", drive: "驱动", control: "控制"};
+// fit_source -> 中文提示（复用/单飞仅作演示可见性，不影响口径）。
+const SOURCE_HINT = {
+  solved: "本次新求解",
+  cache: "复用同批最近一次成功拟合（P、q 与当前快照相同）",
+  inflight_reuse: "并入在途拟合，相同输入只求解一次",
+  actuals: "全检实数",
+  gated: "门控撤下",
+  failed: "拟合失败",
+};
 let state = null;
 let filter = "all";
 let pollTimer = null;
+let lastVersion = -1;
+
+// 迟到响应保护：只接受不旧于已显示记录的快照，避免轮询/在途拟合的
+// 旧结果覆盖窗口中已经显示的较新记录。
+function acceptSnapshot(next) {
+  const v = next && next.estimate ? Number(next.estimate.version) : NaN;
+  if (Number.isFinite(v) && v < lastVersion) return false;
+  state = next;
+  if (Number.isFinite(v)) lastVersion = v;
+  return true;
+}
 
 function toast(msg, isErr) {
   const el = document.getElementById("toast");
@@ -164,7 +184,9 @@ document.getElementById("uploadBtn").addEventListener("click", async () => {
   const fd = new FormData();
   fd.append("file", f);
   try {
-    state = await api("/api/batch", {method: "POST", body: fd});
+    const next = await api("/api/batch", {method: "POST", body: fd});
+    lastVersion = Number(next.estimate.version) || 0;
+    state = next;
     toast(`已载入 ${state.estimate.n_total} 台机器`);
     render();
   } catch (e) { toast(e.message, true); }
@@ -182,25 +204,28 @@ document.querySelectorAll(".filters button").forEach(btn => {
 
 async function refresh() {
   try {
-    state = await api("/api/batch");
-    render();
+    const next = await api("/api/batch");
+    // 丢弃迟到的旧版本响应，避免覆盖窗口中已显示的较新记录。
+    if (acceptSnapshot(next)) render();
   } catch (e) { /* 批次不存在等情况静默 */ }
 }
 
 async function inspect(id, category) {
   try {
-    state = await api(`/api/machines/${encodeURIComponent(id)}/inspect`, {
+    const next = await api(`/api/machines/${encodeURIComponent(id)}/inspect`, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({category}),
     });
+    acceptSnapshot(next);
     render();
   } catch (e) { toast(e.message, true); }
 }
 async function withdraw(id) {
   try {
-    state = await api(`/api/machines/${encodeURIComponent(id)}/withdraw`,
+    const next = await api(`/api/machines/${encodeURIComponent(id)}/withdraw`,
       {method: "POST"});
+    acceptSnapshot(next);
     render();
   } catch (e) { toast(e.message, true); }
 }
@@ -217,9 +242,16 @@ function render() {
 function renderEstimate() {
   const e = state.estimate;
   document.getElementById("progressText").textContent =
-    `共 ${e.n_total} 台｜已检 ${e.n_inspected} 台｜未检 ${e.n_uninspected} 台`;
+    `共 ${e.n_total} 台｜已检 ${e.n_inspected} 台｜未检 ${e.n_uninspected} 台` +
+    `｜记录版本 v${e.version}`;
   const alertBox = document.getElementById("alertBox");
-  if (e.n_uninspected === 0) {
+  const sourceHint = SOURCE_HINT[e.fit_source] || "";
+  if (e.fit_source === "failed") {
+    // 拟合失败：明确提示；已登记实检保留，同一输入可重试。
+    alertBox.innerHTML =
+      `<div class="alert err">拟合失败：${e.fit_error || e.reason || "未知错误"}` +
+      `（实检记录已保留，可稍后重试或继续拆检）。</div>`;
+  } else if (e.n_uninspected === 0) {
     alertBox.innerHTML =
       '<div class="alert ok">全部拆检完毕，以下为实检实数，无需拟合估算。</div>';
   } else if (!e.available) {
@@ -228,7 +260,8 @@ function renderEstimate() {
   } else {
     alertBox.innerHTML =
       `<div class="alert info">估数有效：基于 ${e.n_inspected} 台实检样本拟合 ` +
-      `${e.n_uninspected} 台未检件的故障占比（最小平方误差 SSE=${fmt(e.sse, 6)}）。</div>`;
+      `${e.n_uninspected} 台未检件的故障占比（最小平方误差 SSE=${fmt(e.sse, 6)}）。` +
+      `<span class="muted">来源：${sourceHint}</span></div>`;
   }
 
   const grid = document.getElementById("statGrid");

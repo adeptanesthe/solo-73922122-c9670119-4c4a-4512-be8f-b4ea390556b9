@@ -12,6 +12,13 @@
 * 折算台数 = ``pi * 未检台数``，再加上各类实检数得到全批估计。
 * 门控：仍有未检件时，任一类实检样本缺失或混淆矩阵不满秩，则撤下估数，
   提示补检；全部拆完时直接给实数，不再做拟合。
+
+缓存与复用
+==========
+最小二乘求解只依赖归一化后的拟合输入 ``(P, q)``。``fit_input_key`` 将其
+固化为可哈希的浮点元组：同一批次内只要最近一次成功拟合的输入与当前快照
+相同，即可直接复用 ``pi`` 与 ``sse``；实检数、未检折算等仍按各自快照
+另行计算。并发请求遇到相同输入时由存储层做单飞合并，求解只执行一次。
 """
 from __future__ import annotations
 
@@ -29,12 +36,50 @@ CAT_INDEX = {c: i for i, c in enumerate(CATEGORIES)}
 
 TOL = 1e-10
 
+# 拟合结果来源（写入响应 fit_source 字段，前端据此提示）。
+FIT_ACTUALS = "actuals"              # 全检，直接给实数
+FIT_GATED = "gated"                  # 门控撤下（缺样本/不满秩）
+FIT_SOLVED = "solved"                # 本次新求解
+FIT_CACHE = "cache"                  # 复用同批最近一次成功拟合
+FIT_INFLIGHT = "inflight_reuse"      # 并入同批在途拟合，只求解一次
+FIT_FAILED = "failed"                # 拟合抛错，可同输入重试
+
+
+class FitError(RuntimeError):
+    """最小二乘拟合失败（数值异常等）。不改变任何拆检记录，可重试。"""
+
+
+@dataclass(frozen=True)
+class SnapshotStats:
+    """一次快照下与拟合相关的全部统计量（持锁期间计算，纯只读）。"""
+
+    version: int
+    n_total: int
+    n_inspected: int
+    n_uninspected: int
+    inspected_counts: dict[str, int]
+    uninspected_initial_counts: dict[str, int]
+    gate_reason: str | None
+    P: np.ndarray | None
+    q: np.ndarray | None
+
+
+@dataclass(frozen=True)
+class FitOutput:
+    """一次成功拟合的可复用结果（与快照无关，只由 P、q 决定）。"""
+
+    pi: tuple[float, ...]
+    sse: float
+
+    def as_array(self) -> np.ndarray:
+        return np.asarray(self.pi, dtype=float)
+
 
 @dataclass
 class EstimateResult:
     """一次估算的完整结果。
 
-    ``available`` 为 False 时（需要补检），``pi`` 等拟合字段为 None。
+    ``available`` 为 False 时（需要补检或拟合失败），``pi`` 等拟合字段为 None。
     """
 
     available: bool
@@ -51,6 +96,9 @@ class EstimateResult:
     estimated_uninspected: dict[str, float] | None
     estimated_total: dict[str, float] | None
     actual_total: dict[str, int] | None
+    version: int = 0
+    fit_source: str | None = None
+    fit_error: str | None = None
 
     def to_payload(self) -> dict:
         return {
@@ -70,6 +118,9 @@ class EstimateResult:
             "estimated_uninspected": self.estimated_uninspected,
             "estimated_total": self.estimated_total,
             "actual_total": self.actual_total,
+            "version": self.version,
+            "fit_source": self.fit_source,
+            "fit_error": self.fit_error,
         }
 
 
@@ -133,11 +184,11 @@ def _solve_simplex(A: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, float]:
     return best_x, best_sse
 
 
-def estimate(machines: list[dict]) -> EstimateResult:
-    """根据当前拆检记录计算估算结果。
+def build_snapshot_stats(machines: list[dict], version: int = 0) -> SnapshotStats:
+    """持锁期间可快速完成的快照统计：计数、门控、P 与 q（满秩时）。
 
-    ``machines`` 为字典列表，每项含 ``id``、``initial``、
-    ``inspected``（None 表示未检）。
+    不做最小二乘求解；求解被单独放到 ``fit_proportions`` 以便缓存与
+    线程池卸载。门控口径与历史版本完全一致。
     """
     n_total = len(machines)
     inspected = [m for m in machines if m["inspected"] is not None]
@@ -152,31 +203,18 @@ def estimate(machines: list[dict]) -> EstimateResult:
     for m in uninspected:
         un_initial_counts[m["initial"]] += 1
 
-    actual_total = {
-        c: inspected_counts[c] if n_un == 0 else None for c in CATEGORIES
-    }
-
-    base = dict(
-        n_total=n_total,
-        n_inspected=n_insp,
-        n_uninspected=n_un,
-        inspected_counts=inspected_counts,
-        uninspected_initial_counts=un_initial_counts,
-    )
-
-    # 全部拆完：直接给实数，不做拟合。
+    # 全部拆完：不做拟合，无门控。
     if n_un == 0:
-        return EstimateResult(
-            available=True,
-            reason=None,
+        return SnapshotStats(
+            version=version,
+            n_total=n_total,
+            n_inspected=n_insp,
+            n_uninspected=0,
+            inspected_counts=inspected_counts,
+            uninspected_initial_counts=un_initial_counts,
+            gate_reason=None,
             P=None,
             q=None,
-            pi=None,
-            sse=None,
-            estimated_uninspected=None,
-            estimated_total={c: float(inspected_counts[c]) for c in CATEGORIES},
-            actual_total=inspected_counts,
-            **base,
         )
 
     # 门控 1：任一类实检样本缺失。
@@ -184,21 +222,20 @@ def estimate(machines: list[dict]) -> EstimateResult:
         CATEGORY_LABELS[c] for c in CATEGORIES if inspected_counts[c] == 0
     ]
     if missing:
-        return EstimateResult(
-            available=False,
-            reason=(
+        return SnapshotStats(
+            version=version,
+            n_total=n_total,
+            n_inspected=n_insp,
+            n_uninspected=n_un,
+            inspected_counts=inspected_counts,
+            uninspected_initial_counts=un_initial_counts,
+            gate_reason=(
                 "仍有未检件，且缺少实检类别样本："
                 + "、".join(missing)
                 + "。请补检后再估算。"
             ),
             P=None,
             q=None,
-            pi=None,
-            sse=None,
-            estimated_uninspected=None,
-            estimated_total=None,
-            actual_total=None,
-            **base,
         )
 
     # 经验混淆概率矩阵 P：行=实检类别，列=初判类别。
@@ -210,50 +247,185 @@ def estimate(machines: list[dict]) -> EstimateResult:
 
     # 门控 2：混淆矩阵不满秩。
     if np.linalg.matrix_rank(P, tol=1e-10) < 3:
-        return EstimateResult(
-            available=False,
-            reason=(
+        return SnapshotStats(
+            version=version,
+            n_total=n_total,
+            n_inspected=n_insp,
+            n_uninspected=n_un,
+            inspected_counts=inspected_counts,
+            uninspected_initial_counts=un_initial_counts,
+            gate_reason=(
                 "仍有未检件，但实检样本得到的混淆概率矩阵不满秩"
                 "（各类实检样本的初判分布线性相关），无法唯一拟合，"
                 "请补充更多拆检样本。"
             ),
-            P=P.tolist(),
+            P=P,
+            q=None,
+        )
+
+    # 未检件初判经验分布 q。
+    q = (
+        np.array([un_initial_counts[c] for c in CATEGORIES], dtype=float) / n_un
+    )
+    return SnapshotStats(
+        version=version,
+        n_total=n_total,
+        n_inspected=n_insp,
+        n_uninspected=n_un,
+        inspected_counts=inspected_counts,
+        uninspected_initial_counts=un_initial_counts,
+        gate_reason=None,
+        P=P,
+        q=q,
+    )
+
+
+def fit_input_key(P: np.ndarray, q: np.ndarray) -> tuple:
+    """把归一化拟合输入固化为可哈希键：P（行优先 9 元素）+ q（3 元素）。
+
+    相同键意味着最小二乘问题完全相同，``pi`` 与 ``sse`` 可直接复用。
+    """
+    return (
+        tuple(float(x) for x in np.asarray(P, dtype=float).flat),
+        tuple(float(x) for x in np.asarray(q, dtype=float).flat),
+    )
+
+
+def fit_proportions(P: np.ndarray, q: np.ndarray) -> FitOutput:
+    """纯 CPU 最小二乘拟合（无锁、无 IO），失败抛 :class:`FitError`。
+
+    仅依赖 ``P``、``q``，与批次快照解耦，便于在线程池中执行并按
+    ``fit_input_key`` 缓存/单飞复用。
+    """
+    try:
+        pi, sse = _solve_simplex(P.T, q)
+    except np.linalg.LinAlgError as exc:
+        raise FitError(
+            "最小二乘求解出现数值异常（矩阵方程无法求解），请稍后重试"
+            "或补充更多拆检样本。"
+        ) from exc
+    pi = np.clip(pi, 0.0, 1.0)
+    total = float(pi.sum())
+    if total <= 0.0 or not np.all(np.isfinite(pi)) or not np.isfinite(sse):
+        raise FitError(
+            "拟合结果异常（出现非数值或退化占比），请稍后重试或补充"
+            "更多拆检样本。"
+        )
+    pi = pi / total
+    return FitOutput(pi=tuple(float(x) for x in pi), sse=float(sse))
+
+
+def assemble_result(
+    stats: SnapshotStats,
+    fit: FitOutput | None = None,
+    fit_source: str | None = None,
+    fit_error: str | None = None,
+) -> EstimateResult:
+    """把快照统计与拟合结果（或门控/失败原因）装配为响应对象。
+
+    折算台数始终按 *当前快照* 的未检台数计算，即便 ``fit`` 复用自
+    更早一次同输入拟合。
+    """
+    base = dict(
+        n_total=stats.n_total,
+        n_inspected=stats.n_inspected,
+        n_uninspected=stats.n_uninspected,
+        inspected_counts=dict(stats.inspected_counts),
+        uninspected_initial_counts=dict(stats.uninspected_initial_counts),
+    )
+
+    # 全部拆完：直接给实数，不做拟合。
+    if fit_source == FIT_ACTUALS:
+        return EstimateResult(
+            available=True,
+            reason=None,
+            P=None,
+            q=None,
+            pi=None,
+            sse=None,
+            estimated_uninspected=None,
+            estimated_total={
+                c: float(stats.inspected_counts[c]) for c in CATEGORIES
+            },
+            actual_total=dict(stats.inspected_counts),
+            version=stats.version,
+            fit_source=FIT_ACTUALS,
+            **base,
+        )
+
+    # 门控撤下（缺类 / 不满秩），沿用原口径：不满秩时仍回传 P。
+    if fit_source == FIT_GATED:
+        return EstimateResult(
+            available=False,
+            reason=stats.gate_reason,
+            P=stats.P.tolist() if stats.P is not None else None,
             q=None,
             pi=None,
             sse=None,
             estimated_uninspected=None,
             estimated_total=None,
             actual_total=None,
+            version=stats.version,
+            fit_source=FIT_GATED,
             **base,
         )
 
-    # 未检件初判经验分布 q。
-    q_arr = np.array(
-        [un_initial_counts[c] for c in CATEGORIES], dtype=float
-    ) / n_un
+    # 拟合失败：撤下估数并提示；实检记录由调用方保留，同输入可重试。
+    if fit_source == FIT_FAILED:
+        return EstimateResult(
+            available=False,
+            reason=fit_error,
+            P=stats.P.tolist() if stats.P is not None else None,
+            q=stats.q.tolist() if stats.q is not None else None,
+            pi=None,
+            sse=None,
+            estimated_uninspected=None,
+            estimated_total=None,
+            actual_total=None,
+            version=stats.version,
+            fit_source=FIT_FAILED,
+            fit_error=fit_error,
+            **base,
+        )
 
-    # 最小化 ||P^T pi - q||^2，约束 pi>=0、sum(pi)=1。
-    pi, sse = _solve_simplex(P.T, q_arr)
-    pi = np.clip(pi, 0.0, 1.0)
-    pi = pi / pi.sum()
-
+    # 成功路径：solved / cache / inflight_reuse。
+    if fit is None:
+        raise FitError("内部错误：缺少拟合结果")
+    pi_arr = fit.as_array()
+    n_un = stats.n_uninspected
     estimated_uninspected = {
-        c: float(pi[i] * n_un) for i, c in enumerate(CATEGORIES)
+        c: float(pi_arr[i] * n_un) for i, c in enumerate(CATEGORIES)
     }
     estimated_total = {
-        c: inspected_counts[c] + estimated_uninspected[c]
+        c: stats.inspected_counts[c] + estimated_uninspected[c]
         for c in CATEGORIES
     }
-
     return EstimateResult(
         available=True,
         reason=None,
-        P=P.tolist(),
-        q=q_arr.tolist(),
-        pi=pi.tolist(),
-        sse=sse,
+        P=stats.P.tolist(),
+        q=stats.q.tolist(),
+        pi=list(fit.pi),
+        sse=fit.sse,
         estimated_uninspected=estimated_uninspected,
         estimated_total=estimated_total,
         actual_total=None,
+        version=stats.version,
+        fit_source=fit_source,
         **base,
     )
+
+
+def estimate(machines: list[dict]) -> EstimateResult:
+    """同步估算（保留给单元测试与离线使用），口径与异步接口完全一致。
+
+    ``machines`` 为字典列表，每项含 ``id``、``initial``、
+    ``inspected``（None 表示未检）。
+    """
+    stats = build_snapshot_stats(machines)
+    if stats.n_uninspected == 0:
+        return assemble_result(stats, fit_source=FIT_ACTUALS)
+    if stats.gate_reason is not None:
+        return assemble_result(stats, fit_source=FIT_GATED)
+    fit = fit_proportions(stats.P, stats.q)
+    return assemble_result(stats, fit=fit, fit_source=FIT_SOLVED)
